@@ -308,6 +308,96 @@ async function extractAvailabilityDom(page, targetDate, mode) {
   }, { targetDate, mode });
 }
 
+
+async function parsePackage(page) {
+  return extractAvailabilityDom(page, config.targetDate, 'package');
+}
+
+async function parseShip(page) {
+  return extractAvailabilityDom(page, config.targetDate, 'ship');
+}
+
+async function inspect(name, url, parser) {
+  const resultBase = {
+    available: false,
+    details: [],
+    observed: [],
+    selectedDate: false,
+    selectedDateText: '',
+    clickedUpdate: false,
+    updateSelector: null,
+    pageUrl: url,
+    error: null,
+  };
+
+  let browser;
+  try {
+    browser = await chromium.launch({ headless: true });
+    const context = await browser.newContext({
+      locale: 'ja-JP',
+      timezoneId: 'Asia/Tokyo',
+      viewport: { width: 1440, height: 1200 },
+    });
+    const page = await context.newPage();
+    page.setDefaultTimeout(30000);
+
+    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
+    await page.waitForTimeout(1000);
+
+    const selected = await selectTargetDate(page, config.targetDate);
+    resultBase.selectedDate = selected.ok;
+    resultBase.selectedDateText = selected.selectedText;
+    if (!selected.ok) {
+      throw new Error(`対象日 ${config.targetDate} を選択できませんでした。`);
+    }
+
+    const updated = await clickUpdate(page);
+    resultBase.clickedUpdate = updated.ok;
+    resultBase.updateSelector = updated.selector;
+    if (!updated.ok) {
+      throw new Error('更新ボタンを押せませんでした。');
+    }
+
+    await page.waitForLoadState('networkidle', { timeout: 15000 }).catch(() => {});
+    await page.waitForTimeout(1200);
+    resultBase.pageUrl = page.url();
+
+    await page.screenshot({
+      path: path.join(DEBUG_DIR, `${name}.png`),
+      fullPage: true,
+    });
+    await fs.writeFile(
+      path.join(DEBUG_DIR, `${name}.html`),
+      await page.content(),
+      'utf8',
+    );
+    await fs.writeFile(
+      path.join(DEBUG_DIR, `${name}.txt`),
+      await page.locator('body').innerText().catch(() => ''),
+      'utf8',
+    );
+
+    const parsed = await parser(page);
+    const merged = { ...resultBase, ...parsed, pageUrl: page.url(), error: null };
+
+    if (name === 'package' && !merged.foundTargetColumn) {
+      merged.error = '更新後の表から対象日の列を特定できませんでした。';
+    }
+    if (name === 'ship' && !merged.foundTargetRow) {
+      merged.error = '更新後の表から対象日の行を特定できませんでした。';
+    }
+
+    return merged;
+  } catch (error) {
+    return {
+      ...resultBase,
+      error: error instanceof Error ? error.message : String(error),
+    };
+  } finally {
+    await browser?.close().catch(() => {});
+  }
+}
+
 async function sendDiscord(message) {
   if (!config.discordWebhook) return false;
   const response = await fetch(config.discordWebhook, {

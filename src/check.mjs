@@ -142,73 +142,103 @@ async function extractAvailabilityDom(page, targetDate, mode) {
       .replace(/[\s　]+/g, ' ')
       .trim();
 
-    function cellInfo(cell) {
-      const media = [...cell.querySelectorAll('img, input[type="image"]')].map((el) => ({
-        alt: el.getAttribute('alt') || '',
-        title: el.getAttribute('title') || '',
-        src: el.getAttribute('src') || '',
-        aria: el.getAttribute('aria-label') || '',
-      }));
-      const attrs = media.flatMap((x) => [x.alt, x.title, x.src, x.aria]).filter(Boolean).join(' ');
-      return {
-        text: normalize(`${cell.innerText || ''} ${cell.textContent || ''} ${attrs}`),
-        html: cell.innerHTML || '',
-        media,
-      };
-    }
-
-    function symbol(info) {
-      const raw = `${info?.text || ''} ${info?.html || ''}`;
-      if (/[○◯]/u.test(raw)) return '○';
-      if (/△/u.test(raw)) return '△';
-      if (/[×✕✖]/u.test(raw)) return '×';
-      if (/空席あり|空きあり|予約可|受付中/u.test(raw)) return '○';
-      if (/満席|空席なし|受付終了|受付停止/u.test(raw)) return '×';
-
-      const lower = raw.toLowerCase();
-      if (/(?:maru|circle|available|vacant|aki|ok)(?:[^a-z0-9]|$)/i.test(lower)) return '○';
-      if (/(?:sankaku|triangle|few|limited)(?:[^a-z0-9]|$)/i.test(lower)) return '△';
-      if (/(?:batsu|cross|unavailable|full|nashi|ng)(?:[^a-z0-9]|$)/i.test(lower)) return '×';
+    const symbolFromRaw = (raw = '') => {
+      const value = normalize(raw);
+      if (/^[○◯]$/u.test(value)) return '○';
+      if (/^△$/u.test(value)) return '△';
+      if (/^[×✕✖]$/u.test(value)) return '×';
+      if (/^(空席あり|空きあり|予約可|受付中)$/u.test(value)) return '○';
+      if (/^(満席|空席なし|受付終了|受付停止)$/u.test(value)) return '×';
+      const lower = value.toLowerCase();
+      if (/(?:^|[\/_-])(maru|circle|available|vacant|aki|ok)(?:[\/_\.-]|$)/i.test(lower)) return '○';
+      if (/(?:^|[\/_-])(sankaku|triangle|few|limited)(?:[\/_\.-]|$)/i.test(lower)) return '△';
+      if (/(?:^|[\/_-])(batsu|cross|unavailable|full|nashi|ng)(?:[\/_\.-]|$)/i.test(lower)) return '×';
       return '';
+    };
+
+    const visible = (el) => {
+      const style = getComputedStyle(el);
+      const rect = el.getBoundingClientRect();
+      return style.display !== 'none' && style.visibility !== 'hidden' && Number(style.opacity || 1) > 0 && rect.width > 1 && rect.height > 1;
+    };
+
+    const boxOf = (el) => {
+      const r = el.getBoundingClientRect();
+      return {
+        x: r.x, y: r.y, width: r.width, height: r.height,
+        cx: r.x + r.width / 2, cy: r.y + r.height / 2,
+        area: r.width * r.height,
+      };
+    };
+
+    const all = [...document.querySelectorAll('body *')].filter(visible);
+
+    // innerTextを持つ要素を視覚座標付きで取得。親子で同じ文字列の場合は小さい要素を優先する。
+    const textItems = all.map((el) => ({
+      el,
+      text: normalize(el.innerText || el.textContent || ''),
+      ...boxOf(el),
+    })).filter((x) => x.text && x.text.length <= 300);
+
+    const smallestMatching = (predicate) => textItems
+      .filter((x) => predicate(x.text))
+      .sort((a, b) => a.area - b.area)[0] || null;
+
+    // 記号はテキストノードだけでなく画像属性・ファイル名からも取得する。
+    const symbolItems = [];
+    for (const el of all) {
+      let raw = '';
+      if (el.matches('img,input[type="image"]')) {
+        raw = [
+          el.getAttribute('alt'), el.getAttribute('title'), el.getAttribute('aria-label'),
+          el.getAttribute('src'), el.getAttribute('value'),
+        ].filter(Boolean).join(' ');
+      } else {
+        const text = normalize(el.innerText || el.textContent || '');
+        if (/^[○◯△×✕✖]$/u.test(text)) raw = text;
+      }
+      const status = symbolFromRaw(raw);
+      if (status) symbolItems.push({ status, raw: normalize(raw), tag: el.tagName, ...boxOf(el) });
     }
 
-    const allRows = [...document.querySelectorAll('tr')].map((row, rowIndex) => ({
-      rowIndex,
-      cells: [...row.cells].map(cellInfo),
-    }));
+    // 重複する親子要素を座標でまとめる。
+    const uniqueSymbols = [];
+    for (const item of symbolItems.sort((a, b) => a.area - b.area)) {
+      if (uniqueSymbols.some((x) => Math.abs(x.cx - item.cx) < 3 && Math.abs(x.cy - item.cy) < 3 && x.status === item.status)) continue;
+      uniqueSymbols.push(item);
+    }
+
+    const nearestSymbol = (x, y, maxDx = 120, maxDy = 55) => uniqueSymbols
+      .map((s) => ({ ...s, dx: Math.abs(s.cx - x), dy: Math.abs(s.cy - y) }))
+      .filter((s) => s.dx <= maxDx && s.dy <= maxDy)
+      .sort((a, b) => (a.dx * 2 + a.dy) - (b.dx * 2 + b.dy))[0] || null;
 
     if (mode === 'ship') {
-      // 日付選択・更新済みの画面では、空席表のデータ行は
-      // 「乗船日 + 6客室」の7セル構成。6客室すべてが○/△/×の行を抽出する。
-      const candidates = allRows.filter(({ cells }) => {
-        if (cells.length < 7) return false;
-        const statuses = cells.slice(1, 7).map(symbol);
-        return statuses.filter(Boolean).length >= 6;
-      });
+      const economy = smallestMatching((t) => /(?:^|\s)[２2]等和室(?:\s|$)/u.test(t));
+      const berth = smallestMatching((t) => /(?:^|\s)[２2]等寝台(?:\s|$)/u.test(t) && !/特/u.test(t));
+      const dateRow = textItems
+        .filter((x) => /9\s*\/\s*18/u.test(x.text) && /(東京|Tokyo)/iu.test(x.text))
+        .sort((a, b) => a.area - b.area)[0] || null;
 
-      // 選択した東京発便は表の先頭データ行。念のため9/18を含む行を優先する。
-      const target = candidates.find(({ cells }) => /9\s*\/\s*18/.test(cells.map((c) => c.text).join(' '))) || candidates[0];
-      if (!target) {
+      if (!economy || !berth || !dateRow) {
         return {
-          available: false,
-          details: [],
-          foundTargetRow: false,
-          observed: [],
+          available: false, details: [], foundTargetRow: false, observed: [],
           debug: {
-            rowCount: allRows.length,
-            rowsWithSevenCells: allRows.filter((r) => r.cells.length >= 7).slice(0, 15).map((r) => ({
-              rowIndex: r.rowIndex,
-              cellCount: r.cells.length,
-              texts: r.cells.map((c) => c.text).slice(0, 7),
-              symbols: r.cells.map(symbol).slice(0, 7),
-            })),
+            reason: 'header-or-date-not-found',
+            economy: economy && { text: economy.text, x: economy.cx, y: economy.cy },
+            berth: berth && { text: berth.text, x: berth.cx, y: berth.cy },
+            dateRow: dateRow && { text: dateRow.text, x: dateRow.cx, y: dateRow.cy },
+            symbolCount: uniqueSymbols.length,
+            symbolSample: uniqueSymbols.slice(0, 20),
           },
         };
       }
 
+      const s1 = nearestSymbol(economy.cx, dateRow.cy);
+      const s2 = nearestSymbol(berth.cx, dateRow.cy);
       const observed = [
-        { room: '2等和室', status: symbol(target.cells[1]) },
-        { room: '2等寝台', status: symbol(target.cells[2]) },
+        { room: '2等和室', status: s1?.status || '' },
+        { room: '2等寝台', status: s2?.status || '' },
       ];
       const availableItems = observed.filter((x) => x.status === '○' || x.status === '△');
       return {
@@ -217,34 +247,52 @@ async function extractAvailabilityDom(page, targetDate, mode) {
         foundTargetRow: observed.every((x) => ['○', '△', '×'].includes(x.status)),
         observed,
         debug: {
-          rowIndex: target.rowIndex,
-          candidateCount: candidates.length,
-          targetTexts: target.cells.map((c) => c.text),
-          targetSymbols: target.cells.map(symbol),
+          method: 'visual-coordinate-v6',
+          headers: { economy: { x: economy.cx, y: economy.cy }, berth: { x: berth.cx, y: berth.cy } },
+          dateRow: { text: dateRow.text, x: dateRow.cx, y: dateRow.cy },
+          matches: { economy: s1, berth: s2 },
+          symbolCount: uniqueSymbols.length,
         },
       };
     }
 
-    // パック画面は対象日を選択して更新すると、各宿泊施設行の3列目以降に
-    // 対象日の○/×が1つだけ表示される。ヘッダー文字に依存せず構造で抽出する。
-    const observed = [];
-    let sequence = 0;
-    for (const { rowIndex, cells } of allRows) {
-      if (cells.length < 3) continue;
-      const statusIndex = cells.findIndex((c, index) => index >= 2 && ['○', '△', '×'].includes(symbol(c)));
-      if (statusIndex < 0) continue;
+    const dateHeader = textItems
+      .filter((x) => /9\s*\/\s*18\s*発/u.test(x.text))
+      .sort((a, b) => a.area - b.area)[0] || null;
 
-      sequence += 1;
-      const accommodation = normalize(cells[0]?.text || '') || `宿泊施設 ${sequence}`;
-      const roomType = normalize(cells[1]?.text || '') || `部屋タイプ ${sequence}`;
-      observed.push({
-        accommodation,
-        roomType,
-        status: symbol(cells[statusIndex]),
-        rowIndex,
-        statusColumn: statusIndex,
-      });
+    if (!dateHeader) {
+      return {
+        available: false, details: [], foundTargetColumn: false, observed: [],
+        debug: {
+          reason: 'date-header-not-found',
+          matchingTexts: textItems.filter((x) => /9\s*\/\s*18/u.test(x.text)).slice(0, 20).map((x) => ({ text: x.text, x: x.cx, y: x.cy, area: x.area })),
+          symbolCount: uniqueSymbols.length,
+          symbolSample: uniqueSymbols.slice(0, 20),
+        },
+      };
     }
+
+    // 9/18列の記号を視覚座標で抽出。カレンダーは○/×を持たないため混入しない。
+    const columnSymbols = uniqueSymbols
+      .filter((s) => s.cy > dateHeader.cy + 8 && Math.abs(s.cx - dateHeader.cx) <= Math.max(55, dateHeader.width * 1.5))
+      .sort((a, b) => a.cy - b.cy);
+
+    const observed = columnSymbols.map((s, index) => {
+      const nearby = textItems
+        .filter((t) => t.cy >= s.cy - 24 && t.cy <= s.cy + 24 && t.cx < s.cx - 15 && t.y < 1000)
+        .sort((a, b) => a.x - b.x || a.area - b.area);
+      const compact = [];
+      for (const t of nearby) {
+        if (compact.some((x) => x.text === t.text || (x.x <= t.x && x.x + x.width >= t.x + t.width))) continue;
+        compact.push(t);
+      }
+      const labels = compact.filter((t) => !/^(父島|母島)$/u.test(t.text)).slice(-3).map((t) => t.text);
+      return {
+        accommodation: labels[0] || `宿泊施設 ${index + 1}`,
+        roomType: labels.slice(1).join(' / ') || `部屋タイプ ${index + 1}`,
+        status: s.status,
+      };
+    });
 
     const details = observed
       .filter((x) => x.status === '○' || x.status === '△')
@@ -254,11 +302,13 @@ async function extractAvailabilityDom(page, targetDate, mode) {
       available: details.length > 0,
       details,
       foundTargetColumn: observed.length > 0,
-      observed: observed.map(({ rowIndex, statusColumn, ...rest }) => rest),
+      observed,
       debug: {
-        rowCount: allRows.length,
-        detectedRows: observed.length,
-        sample: observed.slice(0, 10),
+        method: 'visual-coordinate-v6',
+        dateHeader: { text: dateHeader.text, x: dateHeader.cx, y: dateHeader.cy, width: dateHeader.width },
+        symbolCount: uniqueSymbols.length,
+        columnSymbolCount: columnSymbols.length,
+        columnSymbols: columnSymbols.slice(0, 30),
       },
     };
   }, { targetDate, mode });

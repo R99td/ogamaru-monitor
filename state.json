@@ -1,15 +1,5 @@
 {
-  "package": {
-    "available": false,
-    "details": []
-  },
-  "ship": {
-    "available": false,
-    "details": []
-  },
-  "lastChecked": "2026-07-18T05:08:20.219Z",
-  "lastErrors": {
-    "package": null,
-    "ship": null
-  }
+  "package": {"available": false, "details": []},
+  "ship": {"available": false, "details": []},
+  "lastChecked": null
 }

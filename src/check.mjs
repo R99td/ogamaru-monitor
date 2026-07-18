@@ -135,192 +135,177 @@ async function clickUpdate(page) {
   return { ok: false, selector: null };
 }
 
-async function collectTables(page) {
-  return page.locator('table').evaluateAll((tables) => tables.map((table) => {
-    const rows = [...table.querySelectorAll('tr')].map((row) => {
-      const expanded = [];
-      const cells = [...row.querySelectorAll(':scope > th, :scope > td')];
+async function extractAvailabilityDom(page, targetDate, mode) {
+  return page.evaluate(({ targetDate, mode }) => {
+    const normalize = (value = '') => String(value)
+      .replace(/\u00a0/g, ' ')
+      .replace(/[\s　]+/g, ' ')
+      .trim();
+    const compact = (value = '') => normalize(value).replace(/[\s　]+/g, '');
+    const halfWidth = (value = '') => value
+      .replace(/[０-９]/g, (c) => String.fromCharCode(c.charCodeAt(0) - 0xFEE0))
+      .replace(/２/g, '2');
 
-      for (const cell of cells) {
-        const imageText = [...cell.querySelectorAll('img')]
-          .map((img) => img.getAttribute('alt') || img.getAttribute('title') || '')
-          .filter(Boolean)
-          .join(' ');
-        const text = `${cell.innerText || cell.textContent || ''} ${imageText}`
-          .replace(/\s+/g, ' ')
-          .trim();
-        const colspan = Math.max(1, Number.parseInt(cell.getAttribute('colspan') || '1', 10) || 1);
-        expanded.push(text);
-        for (let i = 1; i < colspan; i += 1) expanded.push('');
+    const [, mm, dd] = targetDate.split('/');
+    const dateTokens = [targetDate, `${Number(mm)}/${Number(dd)}`, `${Number(mm)}/${Number(dd)}発`]
+      .map(compact);
+
+    function cellInfo(cell) {
+      const imageAttrs = [...cell.querySelectorAll('img, input[type="image"]')]
+        .flatMap((el) => [
+          el.getAttribute('alt'),
+          el.getAttribute('title'),
+          el.getAttribute('src'),
+          el.getAttribute('aria-label'),
+        ])
+        .filter(Boolean)
+        .join(' ');
+      const text = normalize(`${cell.innerText || ''} ${cell.textContent || ''} ${imageAttrs}`);
+      const html = cell.innerHTML || '';
+      return { text, html };
+    }
+
+    function directRows(table) {
+      return [...table.rows].filter((row) => row.closest('table') === table);
+    }
+
+    function cells(row) {
+      return [...row.cells].map(cellInfo);
+    }
+
+    function containsDate(value) {
+      const c = compact(value);
+      return dateTokens.some((token) => c.includes(token));
+    }
+
+    function symbol(info) {
+      const raw = `${info.text} ${info.html}`;
+      if (/[○◯]/u.test(raw)) return '○';
+      if (/△/u.test(raw)) return '△';
+      if (/[×✕✖]/u.test(raw)) return '×';
+      if (/空席あり|空きあり|予約可|受付中/u.test(raw)) return '○';
+      if (/満席|空席なし|受付終了|受付停止/u.test(raw)) return '×';
+
+      const lower = raw.toLowerCase();
+      // 画像ファイル名で記号を表している場合にも対応する。
+      if (/(?:maru|circle|available|vacant|ok|yes)[^a-z0-9]?/i.test(lower)) return '○';
+      if (/(?:sankaku|triangle|few|limited)/i.test(lower)) return '△';
+      if (/(?:batsu|cross|unavailable|full|ng|no)[^a-z0-9]?/i.test(lower)) return '×';
+      return normalize(info.text);
+    }
+
+    const tables = [...document.querySelectorAll('table')];
+
+    if (mode === 'ship') {
+      for (const table of tables) {
+        const rows = directRows(table);
+        let header = null;
+        let idxWashitsu = -1;
+        let idxShindai = -1;
+
+        for (const row of rows) {
+          const cs = cells(row);
+          const normalizedCells = cs.map((c) => halfWidth(compact(c.text)));
+          const w = normalizedCells.findIndex((t) => t.includes('2等和室'));
+          const b = normalizedCells.findIndex((t) => t.includes('2等寝台'));
+          if (w >= 0 && b >= 0) {
+            header = row;
+            idxWashitsu = w;
+            idxShindai = b;
+            break;
+          }
+        }
+        if (!header) continue;
+
+        const headerIndex = rows.indexOf(header);
+        for (const row of rows.slice(headerIndex + 1)) {
+          const cs = cells(row);
+          const rowText = cs.map((c) => c.text).join(' ');
+          if (!containsDate(rowText) || !/東京|Tokyo/u.test(rowText)) continue;
+
+          const observed = [
+            { room: '2等和室', status: symbol(cs[idxWashitsu] || { text: '', html: '' }) },
+            { room: '2等寝台', status: symbol(cs[idxShindai] || { text: '', html: '' }) },
+          ];
+          const availableItems = observed.filter((x) => x.status === '○' || x.status === '△');
+          return {
+            available: availableItems.length > 0,
+            details: availableItems.map((x) => `${x.room}：${x.status}`),
+            foundTargetRow: true,
+            observed,
+            debug: { tableCount: tables.length, rowText },
+          };
+        }
       }
-      return expanded;
-    }).filter((row) => row.some(Boolean));
-    return rows;
-  }).filter((rows) => rows.length));
-}
-
-function compact(text = '') {
-  return normalize(text).replace(/[\s　]+/g, '');
-}
-
-function includesAny(text, variants) {
-  const value = compact(text);
-  return variants.some((variant) => value.includes(compact(variant)));
-}
-
-function isAvailableStatus(text) {
-  const value = compact(text);
-  return /○|◯|△|空席あり|空きあり|予約可|受付中/u.test(value);
-}
-
-function isUnavailableStatus(text) {
-  const value = compact(text);
-  return /×|✕|✖|―|満席|空席なし|受付終了|受付停止/u.test(value);
-}
-
-function isTargetDateCell(text, targetDate) {
-  const [, month, day] = targetDate.split('/');
-  const m = String(Number(month));
-  const d = String(Number(day));
-  const value = compact(text);
-  return [targetDate, `${month}/${day}`, `${m}/${d}`, `${m}/${d}発`]
-    .some((variant) => value.includes(compact(variant)));
-}
-
-function parseShip(tables, targetDate) {
-  const roomDefinitions = [
-    { name: '2等和室', variants: ['2等和室', '２等和室'] },
-    { name: '2等寝台', variants: ['2等寝台', '２等寝台'] },
-  ];
-
-  for (const rows of tables) {
-    for (let headerIndex = 0; headerIndex < rows.length; headerIndex += 1) {
-      const header = rows[headerIndex];
-      const roomColumns = roomDefinitions.map(({ name, variants }) => ({
-        name,
-        index: header.findIndex((cell) => includesAny(cell, variants)),
-      }));
-      if (roomColumns.some(({ index }) => index < 0)) continue;
-
-      const targetRow = rows.slice(headerIndex + 1).find((row) => {
-        const rowText = row.join(' ');
-        return row.some((cell) => isTargetDateCell(cell, targetDate)) && /東京|Tokyo/u.test(rowText);
-      });
-      if (!targetRow) continue;
-
-      const observed = roomColumns.map(({ name, index }) => ({
-        room: name,
-        status: normalize(targetRow[index] || ''),
-      }));
-      const available = observed.filter(({ status }) => isAvailableStatus(status));
-
       return {
-        available: available.length > 0,
-        details: available.map(({ room, status }) => `${room}：${status || '○'}`),
-        foundTargetRow: true,
-        observed,
+        available: false,
+        details: [],
+        foundTargetRow: false,
+        observed: [],
+        debug: {
+          tableCount: tables.length,
+          matchingTexts: [...document.querySelectorAll('tr')]
+            .map((r) => normalize(r.innerText || r.textContent || ''))
+            .filter((t) => /9\/18|２等和室|2等和室/u.test(t))
+            .slice(0, 20),
+        },
       };
     }
-  }
 
-  return { available: false, details: [], foundTargetRow: false, observed: [] };
-}
+    const details = [];
+    const observed = [];
+    let foundTargetColumn = false;
 
-function parsePackage(tables, targetDate) {
-  const details = [];
-  const observed = [];
-  let foundTargetColumn = false;
+    for (const table of tables) {
+      const rows = directRows(table);
+      let headerIndex = -1;
+      let targetColumn = -1;
 
-  for (const rows of tables) {
-    for (let headerIndex = 0; headerIndex < rows.length; headerIndex += 1) {
-      const header = rows[headerIndex];
-      const headerText = header.join(' ');
-      if (!/宿名|Accommodation/u.test(headerText) || !/部屋タイプ|Room type/u.test(headerText)) continue;
-
-      const targetColumn = header.findIndex((cell) => isTargetDateCell(cell, targetDate));
-      if (targetColumn < 0) continue;
-      foundTargetColumn = true;
+      for (let i = 0; i < rows.length; i += 1) {
+        const cs = cells(rows[i]);
+        const rowText = cs.map((c) => c.text).join(' ');
+        if (!/宿名|Accommodation/u.test(rowText) || !/部屋タイプ|Room type/u.test(rowText)) continue;
+        const dateIndex = cs.findIndex((c) => containsDate(c.text));
+        if (dateIndex >= 0) {
+          headerIndex = i;
+          targetColumn = dateIndex;
+          foundTargetColumn = true;
+          break;
+        }
+      }
+      if (headerIndex < 0) continue;
 
       for (const row of rows.slice(headerIndex + 1)) {
-        if (row.length <= targetColumn) continue;
-        // 次の地域テーブルの見出しに到達したら、このテーブル内の処理を終了する。
-        const rowText = row.join(' ');
+        const cs = cells(row);
+        if (cs.length <= targetColumn) continue;
+        const rowText = cs.map((c) => c.text).join(' ');
         if (/宿名|Accommodation/u.test(rowText) && /部屋タイプ|Room type/u.test(rowText)) break;
 
-        const status = normalize(row[targetColumn] || '');
-        if (!isAvailableStatus(status) && !isUnavailableStatus(status)) continue;
-
-        const accommodation = normalize(row[0] || '');
-        const roomType = normalize(row[1] || '');
+        const status = symbol(cs[targetColumn]);
+        if (!['○', '△', '×'].includes(status)) continue;
+        const accommodation = normalize(cs[0]?.text || '');
+        const roomType = normalize(cs[1]?.text || '');
         observed.push({ accommodation, roomType, status });
-        if (isAvailableStatus(status)) {
-          details.push(`${accommodation}${roomType ? ` / ${roomType}` : ''}：${status || '○'}`);
+        if (status === '○' || status === '△') {
+          details.push(`${accommodation}${roomType ? ` / ${roomType}` : ''}：${status}`);
         }
       }
     }
-  }
-
-  return {
-    available: details.length > 0,
-    details: [...new Set(details)].slice(0, 50),
-    foundTargetColumn,
-    observed,
-  };
-}
-
-async function inspect(kind, url, parser) {
-  const browser = await chromium.launch({ headless: true });
-  const context = await browser.newContext({
-    locale: 'ja-JP',
-    viewport: { width: 1500, height: 1000 },
-    userAgent: 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/130 Safari/537.36 OgamaruAvailabilityMonitor/2.0',
-  });
-  const page = await context.newPage();
-
-  try {
-    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
-    await page.waitForTimeout(1200);
-
-    const selected = await selectTargetDate(page, config.targetDate);
-    const updated = selected.ok ? await clickUpdate(page) : { ok: false, selector: null };
-    await page.waitForTimeout(1500);
-
-    const tables = await collectTables(page);
-    const bodyText = normalize(await page.locator('body').innerText());
-    const result = parser(tables, config.targetDate);
-
-    await page.screenshot({ path: path.join(DEBUG_DIR, `${kind}.png`), fullPage: true });
-    await fs.writeFile(path.join(DEBUG_DIR, `${kind}.txt`), bodyText, 'utf8');
-    await fs.writeFile(
-      path.join(DEBUG_DIR, `${kind}.json`),
-      JSON.stringify({ selected, updated, result, pageUrl: page.url() }, null, 2),
-      'utf8',
-    );
-
-    const validResult = kind === 'ship' ? result.foundTargetRow : result.foundTargetColumn;
-    const error = !selected.ok
-      ? `対象日を選択できませんでした。選択値: ${selected.selectedText || '(なし)'}`
-      : !updated.ok
-        ? '「更新」を実行できませんでした。'
-        : !validResult
-          ? '更新後の表から対象日を特定できませんでした。'
-          : null;
 
     return {
-      ...result,
-      selectedDate: selected.ok,
-      selectedDateText: selected.selectedText,
-      clickedUpdate: updated.ok,
-      updateSelector: updated.selector,
-      pageUrl: page.url(),
-      error,
+      available: details.length > 0,
+      details,
+      foundTargetColumn,
+      observed,
+      debug: {
+        tableCount: tables.length,
+        matchingTexts: [...document.querySelectorAll('tr')]
+          .map((r) => normalize(r.innerText || r.textContent || ''))
+          .filter((t) => /9\/18発|宿名|部屋タイプ/u.test(t))
+          .slice(0, 30),
+      },
     };
-  } catch (error) {
-    await page.screenshot({ path: path.join(DEBUG_DIR, `${kind}-error.png`), fullPage: true }).catch(() => {});
-    return { available: false, details: [], error: String(error) };
-  } finally {
-    await browser.close();
-  }
+  }, { targetDate, mode });
 }
 
 async function sendDiscord(message) {
@@ -359,7 +344,7 @@ const packageResult = await inspect('package', config.packageUrl, parsePackage);
 const shipResult = await inspect('ship', config.shipUrl, parseShip);
 const now = new Date().toISOString();
 
-console.log(JSON.stringify({ packageResult, shipResult }, null, 2));
+console.log(JSON.stringify({ parserVersion: 'dom-v3-20260718', packageResult, shipResult }, null, 2));
 
 if (config.testNotification) {
   await notify(

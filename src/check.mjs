@@ -265,12 +265,87 @@ async function extractAvailabilityDom(page, targetDate, mode) {
 }
 
 
+async function parseAcrossFrames(page, mode) {
+  const frameResults = [];
+
+  for (const frame of page.frames()) {
+    try {
+      const result = await extractAvailabilityDom(frame, config.targetDate, mode);
+      frameResults.push({
+        frameUrl: frame.url(),
+        frameName: frame.name(),
+        result,
+      });
+    } catch (error) {
+      frameResults.push({
+        frameUrl: frame.url(),
+        frameName: frame.name(),
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+
+  const success = frameResults.find(({ result }) =>
+    mode === 'package' ? result?.foundTargetColumn : result?.foundTargetRow,
+  );
+
+  if (success) {
+    return {
+      ...success.result,
+      debug: {
+        ...(success.result.debug || {}),
+        matchedFrameUrl: success.frameUrl,
+        matchedFrameName: success.frameName,
+        frameCount: frameResults.length,
+      },
+    };
+  }
+
+  const best = frameResults
+    .filter(({ result }) => result)
+    .sort((a, b) => {
+      const score = (entry) => {
+        const debug = entry.result?.debug || {};
+        return Number(debug.detectedRows || 0)
+          + Number(debug.candidateCount || 0)
+          + Number(debug.rowCount || 0) / 1000;
+      };
+      return score(b) - score(a);
+    })[0];
+
+  const fallback = best?.result || {
+    available: false,
+    details: [],
+    observed: [],
+    ...(mode === 'package' ? { foundTargetColumn: false } : { foundTargetRow: false }),
+  };
+
+  return {
+    ...fallback,
+    debug: {
+      ...(fallback.debug || {}),
+      frameCount: frameResults.length,
+      frames: frameResults.map(({ frameUrl, frameName, result, error }) => ({
+        frameUrl,
+        frameName,
+        error: error || null,
+        rowCount: result?.debug?.rowCount ?? null,
+        detectedRows: result?.debug?.detectedRows ?? null,
+        candidateCount: result?.debug?.candidateCount ?? null,
+        found: mode === 'package'
+          ? Boolean(result?.foundTargetColumn)
+          : Boolean(result?.foundTargetRow),
+      })),
+    },
+  };
+}
+
 async function parsePackage(page) {
-  return extractAvailabilityDom(page, config.targetDate, 'package');
+  return parseAcrossFrames(page, 'package');
 }
 
 async function parseShip(page) {
-  return extractAvailabilityDom(page, config.targetDate, 'ship');
+  return parseAcrossFrames(page, 'ship');
 }
 
 async function inspect(name, url, parser) {
@@ -390,7 +465,7 @@ const packageResult = await inspect('package', config.packageUrl, parsePackage);
 const shipResult = await inspect('ship', config.shipUrl, parseShip);
 const now = new Date().toISOString();
 
-console.log(JSON.stringify({ parserVersion: 'structural-v4-20260718', packageResult, shipResult }, null, 2));
+console.log(JSON.stringify({ parserVersion: 'frames-v5-20260718', packageResult, shipResult }, null, 2));
 
 if (config.testNotification) {
   await notify(

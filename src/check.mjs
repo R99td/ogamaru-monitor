@@ -43,8 +43,9 @@ async function selectTargetDate(page, targetDate) {
       const value = await option.getAttribute('value');
       if (value !== null) await select.selectOption(value);
       else await select.selectOption({ index });
-      await page.waitForLoadState('networkidle').catch(() => {});
-      await page.waitForTimeout(1500);
+      // サイト側のJavaScriptがchangeイベントを監視している場合にも対応
+      await select.dispatchEvent('change').catch(() => {});
+      await page.waitForTimeout(500);
       return true;
     }
   }
@@ -56,7 +57,8 @@ async function clickLikelySearchButton(page) {
     'input[type="submit"]', 'button[type="submit"]',
     'input[value*="検索"]', 'button:has-text("検索")',
     'input[value*="空席"]', 'button:has-text("空席")',
-    'input[value*="表示"]', 'button:has-text("表示")'
+    'input[value*="表示"]', 'button:has-text("表示")',
+    'input[value*="更新"]', 'button:has-text("更新")'
   ];
   for (const selector of candidates) {
     const item = page.locator(selector).first();
@@ -130,13 +132,15 @@ async function inspect(kind, url, parser) {
     await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
     await page.waitForTimeout(1500);
     const selected = await selectTargetDate(page, config.targetDate);
-    if (selected) await clickLikelySearchButton(page);
+    const updated = selected ? await clickLikelySearchButton(page) : false;
+    // 更新後に結果表が書き換わるまで少し待つ
+    if (updated) await page.waitForTimeout(2000);
     const rows = await collectTableRows(page);
     const bodyText = normalize(await page.locator('body').innerText());
     await page.screenshot({ path: path.join(DEBUG_DIR, `${kind}.png`), fullPage: true });
     await fs.writeFile(path.join(DEBUG_DIR, `${kind}.txt`), bodyText, 'utf8');
     const result = parser(rows, config.targetDate);
-    return { ...result, selectedDate: selected, pageUrl: page.url(), error: null };
+    return { ...result, selectedDate: selected, clickedUpdate: updated, pageUrl: page.url(), error: null };
   } catch (error) {
     await page.screenshot({ path: path.join(DEBUG_DIR, `${kind}-error.png`), fullPage: true }).catch(() => {});
     return { available: false, details: [], error: String(error) };

@@ -137,110 +137,132 @@ async function clickUpdate(page) {
 
 async function collectTables(page) {
   return page.locator('table').evaluateAll((tables) => tables.map((table) => {
-    const rows = [...table.querySelectorAll('tr')].map((row) =>
-      [...row.querySelectorAll(':scope > th, :scope > td')]
-        .map((cell) => (cell.innerText || '').replace(/\s+/g, ' ').trim())
-    ).filter((row) => row.some(Boolean));
+    const rows = [...table.querySelectorAll('tr')].map((row) => {
+      const expanded = [];
+      const cells = [...row.querySelectorAll(':scope > th, :scope > td')];
+
+      for (const cell of cells) {
+        const imageText = [...cell.querySelectorAll('img')]
+          .map((img) => img.getAttribute('alt') || img.getAttribute('title') || '')
+          .filter(Boolean)
+          .join(' ');
+        const text = `${cell.innerText || cell.textContent || ''} ${imageText}`
+          .replace(/\s+/g, ' ')
+          .trim();
+        const colspan = Math.max(1, Number.parseInt(cell.getAttribute('colspan') || '1', 10) || 1);
+        expanded.push(text);
+        for (let i = 1; i < colspan; i += 1) expanded.push('');
+      }
+      return expanded;
+    }).filter((row) => row.some(Boolean));
     return rows;
   }).filter((rows) => rows.length));
 }
 
+function compact(text = '') {
+  return normalize(text).replace(/[\s　]+/g, '');
+}
+
+function includesAny(text, variants) {
+  const value = compact(text);
+  return variants.some((variant) => value.includes(compact(variant)));
+}
+
+function isAvailableStatus(text) {
+  const value = compact(text);
+  return /○|◯|△|空席あり|空きあり|予約可|受付中/u.test(value);
+}
+
+function isUnavailableStatus(text) {
+  const value = compact(text);
+  return /×|✕|✖|―|満席|空席なし|受付終了|受付停止/u.test(value);
+}
+
 function isTargetDateCell(text, targetDate) {
-  const normalized = normalize(text);
-  return dateVariants(targetDate).some((variant) => normalized.includes(variant));
+  const [, month, day] = targetDate.split('/');
+  const m = String(Number(month));
+  const d = String(Number(day));
+  const value = compact(text);
+  return [targetDate, `${month}/${day}`, `${m}/${d}`, `${m}/${d}発`]
+    .some((variant) => value.includes(compact(variant)));
 }
 
 function parseShip(tables, targetDate) {
-  const targetHeaders = [
-    ['2等和室', '２等和室'],
-    ['2等寝台', '２等寝台'],
+  const roomDefinitions = [
+    { name: '2等和室', variants: ['2等和室', '２等和室'] },
+    { name: '2等寝台', variants: ['2等寝台', '２等寝台'] },
   ];
 
   for (const rows of tables) {
-    const headerIndex = rows.findIndex((row) =>
-      targetHeaders.every((variants) => row.some((cell) => variants.some((v) => cell.includes(v))))
-    );
-    if (headerIndex < 0) continue;
+    for (let headerIndex = 0; headerIndex < rows.length; headerIndex += 1) {
+      const header = rows[headerIndex];
+      const roomColumns = roomDefinitions.map(({ name, variants }) => ({
+        name,
+        index: header.findIndex((cell) => includesAny(cell, variants)),
+      }));
+      if (roomColumns.some(({ index }) => index < 0)) continue;
 
-    const header = rows[headerIndex];
-    const roomColumns = targetHeaders.map((variants) => {
-      const index = header.findIndex((cell) => variants.some((v) => cell.includes(v)));
-      return { name: variants[0], index };
-    });
+      const targetRow = rows.slice(headerIndex + 1).find((row) => {
+        const rowText = row.join(' ');
+        return row.some((cell) => isTargetDateCell(cell, targetDate)) && /東京|Tokyo/u.test(rowText);
+      });
+      if (!targetRow) continue;
 
-    const targetRow = rows.slice(headerIndex + 1).find((row) =>
-      row.some((cell) => isTargetDateCell(cell, targetDate)) &&
-      row.some((cell) => /東京|Tokyo/u.test(cell))
-    );
+      const observed = roomColumns.map(({ name, index }) => ({
+        room: name,
+        status: normalize(targetRow[index] || ''),
+      }));
+      const available = observed.filter(({ status }) => isAvailableStatus(status));
 
-    if (!targetRow) {
       return {
-        available: false,
-        details: [],
-        foundTargetRow: false,
-        observed: [],
+        available: available.length > 0,
+        details: available.map(({ room, status }) => `${room}：${status || '○'}`),
+        foundTargetRow: true,
+        observed,
       };
     }
-
-    const observed = roomColumns.map(({ name, index }) => ({
-      room: name,
-      status: index >= 0 ? normalize(targetRow[index] || '') : '',
-    }));
-    const available = observed.filter(({ status }) => AVAILABLE_RE.test(status));
-
-    return {
-      available: available.length > 0,
-      details: available.map(({ room, status }) => `${room}：${status}`),
-      foundTargetRow: true,
-      observed,
-    };
   }
 
-  return {
-    available: false,
-    details: [],
-    foundTargetRow: false,
-    observed: [],
-  };
+  return { available: false, details: [], foundTargetRow: false, observed: [] };
 }
 
 function parsePackage(tables, targetDate) {
-  const targetHeaderVariants = dateVariants(targetDate);
   const details = [];
   const observed = [];
   let foundTargetColumn = false;
 
   for (const rows of tables) {
-    const headerIndex = rows.findIndex((row) =>
-      row.some((cell) => targetHeaderVariants.some((variant) => cell.includes(variant))) &&
-      row.some((cell) => /部屋タイプ|Room type/u.test(cell))
-    );
-    if (headerIndex < 0) continue;
+    for (let headerIndex = 0; headerIndex < rows.length; headerIndex += 1) {
+      const header = rows[headerIndex];
+      const headerText = header.join(' ');
+      if (!/宿名|Accommodation/u.test(headerText) || !/部屋タイプ|Room type/u.test(headerText)) continue;
 
-    const header = rows[headerIndex];
-    const targetColumn = header.findIndex((cell) =>
-      targetHeaderVariants.some((variant) => cell.includes(variant))
-    );
-    if (targetColumn < 0) continue;
-    foundTargetColumn = true;
+      const targetColumn = header.findIndex((cell) => isTargetDateCell(cell, targetDate));
+      if (targetColumn < 0) continue;
+      foundTargetColumn = true;
 
-    for (const row of rows.slice(headerIndex + 1)) {
-      if (row.length <= targetColumn) continue;
-      const status = normalize(row[targetColumn] || '');
-      if (!AVAILABLE_RE.test(status) && !UNAVAILABLE_RE.test(status)) continue;
+      for (const row of rows.slice(headerIndex + 1)) {
+        if (row.length <= targetColumn) continue;
+        // 次の地域テーブルの見出しに到達したら、このテーブル内の処理を終了する。
+        const rowText = row.join(' ');
+        if (/宿名|Accommodation/u.test(rowText) && /部屋タイプ|Room type/u.test(rowText)) break;
 
-      const accommodation = normalize(row[0] || '');
-      const roomType = normalize(row[1] || '');
-      observed.push({ accommodation, roomType, status });
-      if (AVAILABLE_RE.test(status)) {
-        details.push(`${accommodation}${roomType ? ` / ${roomType}` : ''}：${status}`);
+        const status = normalize(row[targetColumn] || '');
+        if (!isAvailableStatus(status) && !isUnavailableStatus(status)) continue;
+
+        const accommodation = normalize(row[0] || '');
+        const roomType = normalize(row[1] || '');
+        observed.push({ accommodation, roomType, status });
+        if (isAvailableStatus(status)) {
+          details.push(`${accommodation}${roomType ? ` / ${roomType}` : ''}：${status || '○'}`);
+        }
       }
     }
   }
 
   return {
     available: details.length > 0,
-    details: [...new Set(details)].slice(0, 30),
+    details: [...new Set(details)].slice(0, 50),
     foundTargetColumn,
     observed,
   };

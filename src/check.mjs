@@ -141,45 +141,24 @@ async function extractAvailabilityDom(page, targetDate, mode) {
       .replace(/\u00a0/g, ' ')
       .replace(/[\s　]+/g, ' ')
       .trim();
-    const compact = (value = '') => normalize(value).replace(/[\s　]+/g, '');
-    const halfWidth = (value = '') => value
-      .replace(/[０-９]/g, (c) => String.fromCharCode(c.charCodeAt(0) - 0xFEE0))
-      .replace(/２/g, '2');
-
-    const [, mm, dd] = targetDate.split('/');
-    const dateTokens = [targetDate, `${Number(mm)}/${Number(dd)}`, `${Number(mm)}/${Number(dd)}発`]
-      .map(compact);
 
     function cellInfo(cell) {
-      const imageAttrs = [...cell.querySelectorAll('img, input[type="image"]')]
-        .flatMap((el) => [
-          el.getAttribute('alt'),
-          el.getAttribute('title'),
-          el.getAttribute('src'),
-          el.getAttribute('aria-label'),
-        ])
-        .filter(Boolean)
-        .join(' ');
-      const text = normalize(`${cell.innerText || ''} ${cell.textContent || ''} ${imageAttrs}`);
-      const html = cell.innerHTML || '';
-      return { text, html };
-    }
-
-    function directRows(table) {
-      return [...table.rows].filter((row) => row.closest('table') === table);
-    }
-
-    function cells(row) {
-      return [...row.cells].map(cellInfo);
-    }
-
-    function containsDate(value) {
-      const c = compact(value);
-      return dateTokens.some((token) => c.includes(token));
+      const media = [...cell.querySelectorAll('img, input[type="image"]')].map((el) => ({
+        alt: el.getAttribute('alt') || '',
+        title: el.getAttribute('title') || '',
+        src: el.getAttribute('src') || '',
+        aria: el.getAttribute('aria-label') || '',
+      }));
+      const attrs = media.flatMap((x) => [x.alt, x.title, x.src, x.aria]).filter(Boolean).join(' ');
+      return {
+        text: normalize(`${cell.innerText || ''} ${cell.textContent || ''} ${attrs}`),
+        html: cell.innerHTML || '',
+        media,
+      };
     }
 
     function symbol(info) {
-      const raw = `${info.text} ${info.html}`;
+      const raw = `${info?.text || ''} ${info?.html || ''}`;
       if (/[○◯]/u.test(raw)) return '○';
       if (/△/u.test(raw)) return '△';
       if (/[×✕✖]/u.test(raw)) return '×';
@@ -187,122 +166,99 @@ async function extractAvailabilityDom(page, targetDate, mode) {
       if (/満席|空席なし|受付終了|受付停止/u.test(raw)) return '×';
 
       const lower = raw.toLowerCase();
-      // 画像ファイル名で記号を表している場合にも対応する。
-      if (/(?:maru|circle|available|vacant|ok|yes)[^a-z0-9]?/i.test(lower)) return '○';
-      if (/(?:sankaku|triangle|few|limited)/i.test(lower)) return '△';
-      if (/(?:batsu|cross|unavailable|full|ng|no)[^a-z0-9]?/i.test(lower)) return '×';
-      return normalize(info.text);
+      if (/(?:maru|circle|available|vacant|aki|ok)(?:[^a-z0-9]|$)/i.test(lower)) return '○';
+      if (/(?:sankaku|triangle|few|limited)(?:[^a-z0-9]|$)/i.test(lower)) return '△';
+      if (/(?:batsu|cross|unavailable|full|nashi|ng)(?:[^a-z0-9]|$)/i.test(lower)) return '×';
+      return '';
     }
 
-    const tables = [...document.querySelectorAll('table')];
+    const allRows = [...document.querySelectorAll('tr')].map((row, rowIndex) => ({
+      rowIndex,
+      cells: [...row.cells].map(cellInfo),
+    }));
 
     if (mode === 'ship') {
-      for (const table of tables) {
-        const rows = directRows(table);
-        let header = null;
-        let idxWashitsu = -1;
-        let idxShindai = -1;
+      // 日付選択・更新済みの画面では、空席表のデータ行は
+      // 「乗船日 + 6客室」の7セル構成。6客室すべてが○/△/×の行を抽出する。
+      const candidates = allRows.filter(({ cells }) => {
+        if (cells.length < 7) return false;
+        const statuses = cells.slice(1, 7).map(symbol);
+        return statuses.filter(Boolean).length >= 6;
+      });
 
-        for (const row of rows) {
-          const cs = cells(row);
-          const normalizedCells = cs.map((c) => halfWidth(compact(c.text)));
-          const w = normalizedCells.findIndex((t) => t.includes('2等和室'));
-          const b = normalizedCells.findIndex((t) => t.includes('2等寝台'));
-          if (w >= 0 && b >= 0) {
-            header = row;
-            idxWashitsu = w;
-            idxShindai = b;
-            break;
-          }
-        }
-        if (!header) continue;
-
-        const headerIndex = rows.indexOf(header);
-        for (const row of rows.slice(headerIndex + 1)) {
-          const cs = cells(row);
-          const rowText = cs.map((c) => c.text).join(' ');
-          if (!containsDate(rowText) || !/東京|Tokyo/u.test(rowText)) continue;
-
-          const observed = [
-            { room: '2等和室', status: symbol(cs[idxWashitsu] || { text: '', html: '' }) },
-            { room: '2等寝台', status: symbol(cs[idxShindai] || { text: '', html: '' }) },
-          ];
-          const availableItems = observed.filter((x) => x.status === '○' || x.status === '△');
-          return {
-            available: availableItems.length > 0,
-            details: availableItems.map((x) => `${x.room}：${x.status}`),
-            foundTargetRow: true,
-            observed,
-            debug: { tableCount: tables.length, rowText },
-          };
-        }
+      // 選択した東京発便は表の先頭データ行。念のため9/18を含む行を優先する。
+      const target = candidates.find(({ cells }) => /9\s*\/\s*18/.test(cells.map((c) => c.text).join(' '))) || candidates[0];
+      if (!target) {
+        return {
+          available: false,
+          details: [],
+          foundTargetRow: false,
+          observed: [],
+          debug: {
+            rowCount: allRows.length,
+            rowsWithSevenCells: allRows.filter((r) => r.cells.length >= 7).slice(0, 15).map((r) => ({
+              rowIndex: r.rowIndex,
+              cellCount: r.cells.length,
+              texts: r.cells.map((c) => c.text).slice(0, 7),
+              symbols: r.cells.map(symbol).slice(0, 7),
+            })),
+          },
+        };
       }
+
+      const observed = [
+        { room: '2等和室', status: symbol(target.cells[1]) },
+        { room: '2等寝台', status: symbol(target.cells[2]) },
+      ];
+      const availableItems = observed.filter((x) => x.status === '○' || x.status === '△');
       return {
-        available: false,
-        details: [],
-        foundTargetRow: false,
-        observed: [],
+        available: availableItems.length > 0,
+        details: availableItems.map((x) => `${x.room}：${x.status}`),
+        foundTargetRow: observed.every((x) => ['○', '△', '×'].includes(x.status)),
+        observed,
         debug: {
-          tableCount: tables.length,
-          matchingTexts: [...document.querySelectorAll('tr')]
-            .map((r) => normalize(r.innerText || r.textContent || ''))
-            .filter((t) => /9\/18|２等和室|2等和室/u.test(t))
-            .slice(0, 20),
+          rowIndex: target.rowIndex,
+          candidateCount: candidates.length,
+          targetTexts: target.cells.map((c) => c.text),
+          targetSymbols: target.cells.map(symbol),
         },
       };
     }
 
-    const details = [];
+    // パック画面は対象日を選択して更新すると、各宿泊施設行の3列目以降に
+    // 対象日の○/×が1つだけ表示される。ヘッダー文字に依存せず構造で抽出する。
     const observed = [];
-    let foundTargetColumn = false;
+    let sequence = 0;
+    for (const { rowIndex, cells } of allRows) {
+      if (cells.length < 3) continue;
+      const statusIndex = cells.findIndex((c, index) => index >= 2 && ['○', '△', '×'].includes(symbol(c)));
+      if (statusIndex < 0) continue;
 
-    for (const table of tables) {
-      const rows = directRows(table);
-      let headerIndex = -1;
-      let targetColumn = -1;
-
-      for (let i = 0; i < rows.length; i += 1) {
-        const cs = cells(rows[i]);
-        const rowText = cs.map((c) => c.text).join(' ');
-        if (!/宿名|Accommodation/u.test(rowText) || !/部屋タイプ|Room type/u.test(rowText)) continue;
-        const dateIndex = cs.findIndex((c) => containsDate(c.text));
-        if (dateIndex >= 0) {
-          headerIndex = i;
-          targetColumn = dateIndex;
-          foundTargetColumn = true;
-          break;
-        }
-      }
-      if (headerIndex < 0) continue;
-
-      for (const row of rows.slice(headerIndex + 1)) {
-        const cs = cells(row);
-        if (cs.length <= targetColumn) continue;
-        const rowText = cs.map((c) => c.text).join(' ');
-        if (/宿名|Accommodation/u.test(rowText) && /部屋タイプ|Room type/u.test(rowText)) break;
-
-        const status = symbol(cs[targetColumn]);
-        if (!['○', '△', '×'].includes(status)) continue;
-        const accommodation = normalize(cs[0]?.text || '');
-        const roomType = normalize(cs[1]?.text || '');
-        observed.push({ accommodation, roomType, status });
-        if (status === '○' || status === '△') {
-          details.push(`${accommodation}${roomType ? ` / ${roomType}` : ''}：${status}`);
-        }
-      }
+      sequence += 1;
+      const accommodation = normalize(cells[0]?.text || '') || `宿泊施設 ${sequence}`;
+      const roomType = normalize(cells[1]?.text || '') || `部屋タイプ ${sequence}`;
+      observed.push({
+        accommodation,
+        roomType,
+        status: symbol(cells[statusIndex]),
+        rowIndex,
+        statusColumn: statusIndex,
+      });
     }
+
+    const details = observed
+      .filter((x) => x.status === '○' || x.status === '△')
+      .map((x) => `${x.accommodation} / ${x.roomType}：${x.status}`);
 
     return {
       available: details.length > 0,
       details,
-      foundTargetColumn,
-      observed,
+      foundTargetColumn: observed.length > 0,
+      observed: observed.map(({ rowIndex, statusColumn, ...rest }) => rest),
       debug: {
-        tableCount: tables.length,
-        matchingTexts: [...document.querySelectorAll('tr')]
-          .map((r) => normalize(r.innerText || r.textContent || ''))
-          .filter((t) => /9\/18発|宿名|部屋タイプ/u.test(t))
-          .slice(0, 30),
+        rowCount: allRows.length,
+        detectedRows: observed.length,
+        sample: observed.slice(0, 10),
       },
     };
   }, { targetDate, mode });
@@ -434,7 +390,7 @@ const packageResult = await inspect('package', config.packageUrl, parsePackage);
 const shipResult = await inspect('ship', config.shipUrl, parseShip);
 const now = new Date().toISOString();
 
-console.log(JSON.stringify({ parserVersion: 'dom-v3-20260718', packageResult, shipResult }, null, 2));
+console.log(JSON.stringify({ parserVersion: 'structural-v4-20260718', packageResult, shipResult }, null, 2));
 
 if (config.testNotification) {
   await notify(

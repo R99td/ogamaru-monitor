@@ -41,8 +41,11 @@ jobs:
           node-version: "20"
           cache: npm
 
+      - name: npmレジストリを公開版に固定
+        run: npm config set registry https://registry.npmjs.org/
+
       - name: パッケージをインストール
-        run: npm ci
+        run: npm ci --no-audit --no-fund
 
       - name: Chromiumをインストール
         run: npx playwright install --with-deps chromium

@@ -1,13 +1,26 @@
 {
   "package": {
-    "available": false,
-    "details": []
+    "available": true,
+    "details": [
+      "父島 パパスアイランドリゾート Papas Island Resort / ２名洋室 BT 2 Western style room / ×：○",
+      "父島 パパスアイランドリゾート HALE Papas Island Resort HALE / ２名洋室 BT 2 Western style room / ×：○",
+      "父島 海遊 Kaiyu / ３名洋室 BT 3 Western style room / ×：○",
+      "父島 サンシャイン小笠原 Sunshine Ogasawara / ２名和室 2 Japanese style room / ×：○",
+      "父島 サンシャイン小笠原 Sunshine Ogasawara / ３名洋室 3 Western style room / ×：○",
+      "父島 ハートロックヴィレッジ Heart Rock Village / ３名洋室 BT※1 3 Western style room / ×：○",
+      "宿泊施設 26 / 部屋タイプ 26：○",
+      "宿泊施設 28 / 部屋タイプ 28：○",
+      "宿泊施設 30 / 部屋タイプ 30：○",
+      "宿泊施設 32 / 部屋タイプ 32：○",
+      "宿泊施設 34 / 部屋タイプ 34：○",
+      "宿泊施設 36 / 部屋タイプ 36：○"
+    ]
   },
   "ship": {
     "available": false,
     "details": []
   },
-  "lastChecked": "2026-07-26T23:29:19.071Z",
+  "lastChecked": "2026-07-27T01:07:55.017Z",
   "lastErrors": {
     "package": null,
     "ship": null
